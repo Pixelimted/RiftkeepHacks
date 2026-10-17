@@ -18,6 +18,18 @@ local COST = CONFIG.multi and 900 or 100
 
 local RARITY = {[1] = "Common", [2] = "Rare", [3] = "Epic", [4] = "Legendary", [5] = "Mythic", [6] = "Rifted"}
 
+local function toast(title, text)
+	task.spawn(function()
+		local args = {Title = title, Text = text, Duration = 6}
+		if not pcall(function() StarterGui:SetCore("SendNotification", args) end) then
+			task.wait(1)
+			pcall(function() StarterGui:SetCore("SendNotification", args) end)
+		end
+	end)
+end
+
+toast("KE", "Running KE")
+
 local function isNet(v)
 	return type(v) == "table" and type(v.requestRoll) == "table" and type(v.rollResult) == "table"
 end
@@ -29,25 +41,45 @@ local function try(mod)
 	end
 end
 
-local Net
-for _, n in ipairs({"Net", "Network", "Packets", "Remotes", "Networking"}) do
-	Net = try(ReplicatedStorage:FindFirstChild(n))
-	if Net then break end
-end
+local lastDeep = 0
 
-if not Net then
-	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
-		if d:IsA("ModuleScript") then
-			local n = d.Name:lower()
-			if n:find("net") or n:find("packet") or n:find("remote") then
-				Net = try(d)
-				if Net then break end
+local function findNet()
+	for _, n in ipairs({"Net", "Network", "Packets", "Remotes", "Networking"}) do
+		local res = try(ReplicatedStorage:FindFirstChild(n))
+		if res then return res end
+	end
+
+	if os.clock() - lastDeep > 3 then
+		lastDeep = os.clock()
+		for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+			if d:IsA("ModuleScript") then
+				local n = d.Name:lower()
+				if n:find("net") or n:find("packet") or n:find("remote") then
+					local res = try(d)
+					if res then return res end
+				end
 			end
 		end
 	end
 end
 
-assert(Net, "couldn't find the Net module")
+local Net = findNet()
+
+if not Net then
+	toast("KE", "waiting for game to completely load in")
+	print("[KE] waiting for game to completely load in")
+
+	local deadline = os.clock() + 60
+	while not Net and os.clock() < deadline do
+		task.wait(0.5)
+		Net = findNet()
+	end
+end
+
+if not Net then
+	toast("KE", "Net module not found")
+	error("couldn't find the Net module")
+end
 
 -- 0.4 sends as packet.send(data), some forks pass the packet first
 local SELF = false
@@ -81,12 +113,6 @@ local running = false
 local pending = false
 local rolls = 0
 local essence = math.huge
-
-local function notify(title, text)
-	pcall(function()
-		StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = 6})
-	end)
-end
 
 on(Net.currencyUpdated, function(d)
 	if type(d) == "table" and type(d.essence) == "number" then
@@ -122,10 +148,10 @@ on(Net.rollResult, function(d)
 		if id == CONFIG.target then
 			local uid = tostring(uids[i])
 			print((">>> %s | uid %s | roll %d"):format(CONFIG.target, uid, rolls))
-			notify(CONFIG.target .. " rolled", "uid " .. uid)
+			toast(CONFIG.target .. " rolled", "uid " .. uid)
 			if CONFIG.stopOnDrop then running = false end
 		elseif r >= CONFIG.alertRarity then
-			notify("Rifted: " .. label(id), "roll " .. tostring(rolls))
+			toast("Rifted: " .. label(id), "roll " .. tostring(rolls))
 		end
 	end
 end)
@@ -147,7 +173,7 @@ function KE.start()
 		while running do
 			if CONFIG.stopWhenBroke and essence < COST then
 				running = false
-				notify("Out of essence", "stopped after " .. tostring(rolls))
+				toast("Out of essence", "stopped after " .. tostring(rolls))
 				print("[KE] out of essence after " .. tostring(rolls) .. " rolls")
 				break
 			end
@@ -170,9 +196,13 @@ end
 local env = getgenv and getgenv() or _G
 env.KE = KE
 
-if CONFIG.autoStart then KE.start() end
+if CONFIG.autoStart then
+	toast("KE", "Rolling for " .. CONFIG.target)
+	KE.start()
+end
 
 print(("[KE] sniping %s on %s | multi=%s | %d essence per request"):format(
 	CONFIG.target, CONFIG.banner, tostring(CONFIG.multi), COST
 ))
+
 return KE
