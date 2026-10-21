@@ -60,7 +60,23 @@ local st = {
 	essence = nil, running = false, waiting = false, scans = 0,
 }
 
--- ui helpers, keep these at the top, everything below uses them
+-- active connections tracking for cleanup on rescan
+local activeConnections = {}
+local function trackConnection(conn)
+	table.insert(activeConnections, conn)
+	return conn
+end
+
+local function cleanupConnections()
+	for _, conn in ipairs(activeConnections) do
+		if typeof(conn) == "RBXScriptConnection" then
+			conn:Disconnect()
+		end
+	end
+	activeConnections = {}
+end
+
+-- ui helpers
 local function new(cls, props, parent)
 	local o = Instance.new(cls)
 	for k, v in next, props do o[k] = v end
@@ -78,7 +94,7 @@ local function pad(o, n)
 end
 
 -- log
-local MAXLOG = 120 -- dont go much higher or the log gets chuggy
+local MAXLOG = 120
 local logBox, logScroll, lines = nil, nil, {}
 
 local function log(msg, c)
@@ -130,9 +146,6 @@ local function nameOf(id)
 	return (type(d) == "table" and d.name) or tostring(id)
 end
 
--- net finding
--- bytenet packets are plain tables with .send/.listen so isPkt covers them
--- and the raw-remote fallback covers the case where nothing else loads
 local SEND = {"requestroll", "rollrequest", "dorequestroll", "roll"}
 local RECV = {"rollresult", "rollresults", "rollresponse", "result"}
 local CUR  = {"currencyupdated", "currencyupdate", "updatedcurrency", "essence"}
@@ -301,7 +314,7 @@ end
 local function scanRemotes()
 	local s, r, c, ss, rr, cc = nil, nil, nil, 0, 0, 0
 	for _, d in next, rs:GetDescendants() do
-		if d:IsA("RemoteEvent") or d:IsA("UnreliableRemoteEvent") then
+		if d:IsA("RemoteEvent") or d:IsA("UnreliableRemoteEvent") or d:IsA("RemoteFunction") then
 			local n = d.Name:lower()
 			local a, b, e = scoreKey(n, SEND), scoreKey(n, RECV), scoreKey(n, CUR)
 			if b > rr then r, rr = d, b end
@@ -312,7 +325,6 @@ local function scanRemotes()
 	return s, r, c
 end
 
--- binding
 local function wantsSelf(f)
 	local ok, n, va = pcall(debug.info, f, "a")
 	if ok and type(n) == "number" then return n >= 2 or (n == 1 and va == true) end
@@ -340,8 +352,8 @@ end
 local function listen(pkt, cb)
 	if isRemote(pkt) then
 		if pkt:IsA("RemoteEvent") or pkt:IsA("UnreliableRemoteEvent") then
-			pkt.OnClientEvent:Connect(cb)
-			return true
+			local conn = trackConnection(pkt.OnClientEvent:Connect(cb))
+			return conn ~= nil
 		end
 		return false
 	end
@@ -349,8 +361,8 @@ local function listen(pkt, cb)
 	local f = pkt.listen or pkt.Listen or pkt.connect or pkt.Connect or pkt.on or pkt.On
 	if type(f) ~= "function" then
 		if typeof(pkt.OnClientEvent) == "RBXScriptSignal" then
-			pkt.OnClientEvent:Connect(cb)
-			return true
+			local conn = trackConnection(pkt.OnClientEvent:Connect(cb))
+			return conn ~= nil
 		end
 		return false
 	end
@@ -390,7 +402,6 @@ local function bindRemote()
 	return true
 end
 
--- results
 local dumped = false
 
 local function onResult(d)
@@ -417,7 +428,9 @@ local function onResult(d)
 
 	local out = {}
 	for i, id in next, ids do
-		out[#out + 1] = nameOf(id) .. " [" .. (RARITY[rar[i]] or "?") .. "]"
+		local rVal = rar[i]
+		local rarityName = (type(rVal) == "number" and RARITY[rVal]) or tostring(rVal) or "?"
+		out[#out + 1] = nameOf(id) .. " [" .. rarityName .. "]"
 	end
 
 	st.rolls = st.rolls + #ids
@@ -425,7 +438,7 @@ local function onResult(d)
 		#out > 0 and table.concat(out, ", ") or "-"))
 
 	for i, id in next, ids do
-		local r = rar[i] or 0
+		local r = tonumber(rar[i]) or 0
 		if id == cfg.target then
 			local uid = tostring(uids[i] or "?")
 			log((">>> %s  uid %s  roll %d"):format(cfg.target, uid, st.rolls), theme.good)
@@ -448,7 +461,6 @@ net.onCurrency = function(d)
 	end
 end
 
--- engine
 local function roll()
 	if not net.fire then return false end
 	st.waiting = true
@@ -460,15 +472,25 @@ local function roll()
 	return ok
 end
 
+local autoRollToggleRef = nil
+
+local function updateAutoRollToggleUI()
+	if autoRollToggleRef and autoRollToggleRef.paint then
+		autoRollToggleRef.paint(st.running)
+	end
+end
+
 local function start()
 	if st.running or not net.fire then return end
 	st.running = true
+	updateAutoRollToggleUI()
 	log("started  target=" .. cfg.target .. "  cost=" .. cost(), theme.blue)
 
 	task.spawn(function()
 		while st.running do
 			if cfg.stopBroke and st.essence and st.essence < cost() then
 				st.running = false
+				updateAutoRollToggleUI()
 				log("out of essence after " .. st.rolls, theme.warn)
 				notify("out of essence", "stopped")
 				break
@@ -476,15 +498,21 @@ local function start()
 			roll()
 			local t = os.clock()
 			while st.running and st.waiting and os.clock() - t < 2 do task.wait(0.05) end
+			if st.waiting then
+				st.waiting = false -- timeout recovery
+			end
 			if st.running and cfg.delay > 0 then task.wait(cfg.delay) end
 		end
+		updateAutoRollToggleUI()
 		log("stopped", theme.dim)
 	end)
 end
 
-local function stop() st.running = false end
+local function stop()
+	st.running = false
+	updateAutoRollToggleUI()
+end
 
--- config file
 local file = "ke_cfg.json"
 local saving = false
 
@@ -513,7 +541,6 @@ local function setopt(k, v)
 	saveCfg()
 end
 
--- ui
 local okHui, hui = pcall(function() return gethui() end)
 local guiParent = (okHui and hui) or game:GetService("CoreGui")
 
@@ -577,28 +604,27 @@ local close = new("TextButton", {
 	TextColor3 = theme.dim,
 }, top)
 
--- drag
 do
-	local held, start, origin = false, nil, nil
-	top.InputBegan:Connect(function(i)
+	local held, startPos, origin = false, nil, nil
+	trackConnection(top.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1
 			or i.UserInputType == Enum.UserInputType.Touch then
-			held, start, origin = true, i.Position, win.Position
+			held, startPos, origin = true, i.Position, win.Position
 		end
-	end)
-	uis.InputChanged:Connect(function(i)
+	end))
+	trackConnection(uis.InputChanged:Connect(function(i)
 		if not held then return end
 		if i.UserInputType == Enum.UserInputType.MouseMovement
 			or i.UserInputType == Enum.UserInputType.Touch then
 			win.Position = UDim2.new(
-				origin.X.Scale, origin.X.Offset + (i.Position.X - start.X),
-				origin.Y.Scale, origin.Y.Offset + (i.Position.Y - start.Y))
+				origin.X.Scale, origin.X.Offset + (i.Position.X - startPos.X),
+				origin.Y.Scale, origin.Y.Offset + (i.Position.Y - startPos.Y))
 		end
-	end)
-	uis.InputEnded:Connect(function(i)
+	end))
+	trackConnection(uis.InputEnded:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1
 			or i.UserInputType == Enum.UserInputType.Touch then held = false end
-	end)
+	end))
 end
 
 local tabRow = new("Frame", {
@@ -638,7 +664,7 @@ local function tab(name)
 	new("UIListLayout", {Padding = UDim.new(0, 2)}, p)
 	pages[name] = p
 
-	b.MouseButton1Click:Connect(function() selectTab(name) end)
+	trackConnection(b.MouseButton1Click:Connect(function() selectTab(name) end))
 	return p
 end
 
@@ -668,35 +694,35 @@ local function toggle(p, text, get, set)
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}, row)
 
-	local pill = new("Frame", {
+	local pillFrame = new("Frame", {
 		Size = UDim2.fromOffset(32, 17),
 		Position = UDim2.new(1, -34, 0.5, -8),
 		BackgroundColor3 = theme.off,
 		BorderSizePixel = 0,
 	}, row)
-	round(pill, 9)
+	round(pillFrame, 9)
 
 	local dot = new("Frame", {
 		Size = UDim2.fromOffset(13, 13),
 		Position = UDim2.fromOffset(2, 2),
 		BackgroundColor3 = theme.text,
 		BorderSizePixel = 0,
-	}, pill)
+	}, pillFrame)
 	round(dot, 7)
 
 	local function paint(on)
-		tw:Create(pill, TweenInfo.new(0.12), {BackgroundColor3 = on and theme.accent or theme.off}):Play()
+		tw:Create(pillFrame, TweenInfo.new(0.12), {BackgroundColor3 = on and theme.accent or theme.off}):Play()
 		tw:Create(dot, TweenInfo.new(0.12), {
 			Position = on and UDim2.fromOffset(17, 2) or UDim2.fromOffset(2, 2),
 		}):Play()
 	end
 
 	paint(get())
-	row.MouseButton1Click:Connect(function()
+	trackConnection(row.MouseButton1Click:Connect(function()
 		local v = not get()
 		set(v)
 		paint(v)
-	end)
+	end))
 
 	return {label = lbl, paint = paint}
 end
@@ -773,21 +799,21 @@ local function slider(p, text, min, max, step, get, set)
 		paint(v)
 	end
 
-	hit.InputBegan:Connect(function(i)
+	trackConnection(hit.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1
 			or i.UserInputType == Enum.UserInputType.Touch then
 			held = true
 			grab(i)
 		end
-	end)
-	uis.InputChanged:Connect(function(i)
+	end))
+	trackConnection(uis.InputChanged:Connect(function(i)
 		if held and (i.UserInputType == Enum.UserInputType.MouseMovement
 			or i.UserInputType == Enum.UserInputType.Touch) then grab(i) end
-	end)
-	uis.InputEnded:Connect(function(i)
+	end))
+	trackConnection(uis.InputEnded:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1
 			or i.UserInputType == Enum.UserInputType.Touch then held = false end
-	end)
+	end))
 end
 
 local function input(p, text, get, set)
@@ -819,7 +845,7 @@ local function input(p, text, get, set)
 	round(box, 4)
 	outline(box, theme.line)
 
-	box.FocusLost:Connect(function() set(box.Text) end)
+	trackConnection(box.FocusLost:Connect(function() set(box.Text) end))
 	return box
 end
 
@@ -834,20 +860,23 @@ local function button(p, text, c, fn)
 		TextColor3 = theme.text,
 	}, p)
 	round(b, 5)
-	b.MouseButton1Click:Connect(fn)
+	trackConnection(b.MouseButton1Click:Connect(fn))
 	return b
 end
 
 -- main tab
 local pg = tab("main")
-toggle(pg, "auto roll", function() return st.running end, function(v)
+autoRollToggleRef = toggle(pg, "auto roll", function() return st.running end, function(v)
 	if v then start() else stop() end
 end)
 toggle(pg, "auto start", function() return cfg.autostart end, function(v) setopt("autostart", v) end)
 
-local multiT = toggle(pg, "multi roll (" .. cost() .. ")", function() return cfg.multi end, function(v)
+local multiT
+multiT = toggle(pg, "multi roll (" .. cost() .. ")", function() return cfg.multi end, function(v)
 	setopt("multi", v)
-	multiT.label.Text = "multi roll (" .. cost() .. ")"
+	if multiT and multiT.label then
+		multiT.label.Text = "multi roll (" .. cost() .. ")"
+	end
 end)
 
 toggle(pg, "stop on drop", function() return cfg.stopDrop end, function(v) setopt("stopDrop", v) end)
@@ -873,8 +902,8 @@ end)
 input(pg2, "banner", function() return cfg.banner end, function(v)
 	if v ~= "" then setopt("banner", v) end
 end)
-slider(pg2, "alert rarity", 1, 6, 1, function() return cfg.alertMin end, function(v) cfg.alertMin = v end)
-slider(pg2, "delay", 0, 2, 0.05, function() return cfg.delay end, function(v) cfg.delay = v end)
+slider(pg2, "alert rarity", 1, 6, 1, function() return cfg.alertMin end, function(v) cfg.alertMin = v; saveCfg() end)
+slider(pg2, "delay", 0, 2, 0.05, function() return cfg.delay end, function(v) cfg.delay = v; saveCfg() end)
 input(pg2, "module path", function() return cfg.path end, function(v) setopt("path", v) end)
 
 local brow2 = new("Frame", {
@@ -885,11 +914,12 @@ local brow2 = new("Frame", {
 new("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6)}, brow2)
 
 button(brow2, "rescan", theme.panel2, function()
+	cleanupConnections()
 	tried, toldOff = {}, {}
 	candTime = 0
 	net.fire = nil
 	st.bound = false
-	log("rescan", theme.warn)
+	log("rescan initiated", theme.warn)
 end).Size = UDim2.new(0.48, 0, 1, 0)
 
 button(brow2, "test fire", theme.panel2, function()
@@ -952,7 +982,6 @@ local statusDot = new("Frame", {
 }, foot)
 round(statusDot, 4)
 
--- pill that shows up when the window is closed
 local pill = new("TextButton", {
 	Size = UDim2.fromOffset(44, 22),
 	Position = UDim2.fromOffset(14, 120),
@@ -967,27 +996,25 @@ local pill = new("TextButton", {
 round(pill, 6)
 outline(pill)
 
-close.MouseButton1Click:Connect(function()
+trackConnection(close.MouseButton1Click:Connect(function()
 	win.Visible = false
 	pill.Visible = true
-end)
+end))
 
-pill.MouseButton1Click:Connect(function()
+trackConnection(pill.MouseButton1Click:Connect(function()
 	win.Visible = true
 	pill.Visible = false
-end)
+end))
 
 selectTab("main")
 
--- keybind
 local key = Enum.KeyCode[cfg.key] or Enum.KeyCode.RightShift
-uis.InputBegan:Connect(function(i)
+trackConnection(uis.InputBegan:Connect(function(i)
 	if i.KeyCode ~= key then return end
 	win.Visible = not win.Visible
 	pill.Visible = not win.Visible
-end)
+end))
 
--- boot
 log("loaded, hunting for the net module")
 
 task.spawn(function()
@@ -1004,7 +1031,7 @@ task.spawn(function()
 				if ok2 and bound then st.bound = true end
 			end
 			if not st.bound and (st.scans <= 3 or st.scans % 6 == 0) then
-				log("scan " .. st.scans .. " - nothing yet", theme.dim)
+				log("scan " + st.scans + " - nothing yet", theme.dim)
 			end
 		end
 		if st.bound and not didStart and cfg.autostart then
@@ -1030,10 +1057,12 @@ task.spawn(function()
 	end
 end)
 
-getgenv().ke = {
-	cfg = cfg,
-	net = net,
-	start = start,
-	stop = stop,
-	roll = roll,
-}
+if type(getgenv) == "function" then
+	getgenv().ke = {
+		cfg = cfg,
+		net = net,
+		start = start,
+		stop = stop,
+		roll = roll,
+	}
+end
